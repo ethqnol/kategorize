@@ -1,0 +1,43 @@
+# Compiled files
+/target/
+
+# Lock files (uncomment if you want to check them in)
+# Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Benchmark results
+/target/criterion/
+
+# Coverage reports
+cobertura.xml
+lcov.info
+tarpaulin-report.html
+
+# Documentation build
+/target/doc/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
