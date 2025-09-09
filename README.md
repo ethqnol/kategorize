@@ -11,6 +11,7 @@ A fast, memory-efficient Rust implementation of k-modes and k-prototypes cluster
 - **K-modes clustering**: Designed specifically for categorical data
 - **K-prototypes clustering**: Handles mixed categorical and numerical data  
 - **Multiple initialization methods**: Huang, Cao, and random initialization
+- **Multiple distance metrics**: Matching, Hamming, and Jaccard distance support
 - **Parallel processing**: Multi-threaded execution for better performance
 - **Memory efficient**: Optimized data structures and algorithms
 - **Comprehensive**: Full-featured with proper error handling and validation
@@ -28,7 +29,7 @@ kategorize = "0.1"
 ### Basic K-modes Clustering
 
 ```rust
-use kategorize::{KModes, InitMethod};
+use kategorize::{KModes, InitMethod, DistanceMetric};
 use ndarray::Array2;
 
 // Create categorical data
@@ -40,6 +41,7 @@ let data = Array2::from_shape_vec((6, 2), vec![
 // Configure and run k-modes clustering
 let kmodes = KModes::new(3)
     .init_method(InitMethod::Huang)
+    .distance_metric(DistanceMetric::Jaccard)  // Choose distance metric
     .max_iter(100)
     .n_init(10)
     .random_state(42);
@@ -93,6 +95,12 @@ K-prototypes combines k-modes and k-means to handle mixed data by:
 - **Cao**: Improved initialization maximizing dissimilarity between initial centroids  
 - **Random**: Randomly selected data points as initial centroids
 
+## Distance Metrics
+
+- **Matching**: Simple matching dissimilarity (0 for match, 1 for mismatch)
+- **Hamming**: Normalized matching distance (proportion of mismatches)
+- **Jaccard**: Set-based similarity, ideal for data with repeated values or tag-like categories
+
 ## Performance
 
 Kategorize is designed for performance with:
@@ -108,12 +116,14 @@ Check out the [examples](examples/) directory for comprehensive usage patterns:
 - [`basic_kmodes.rs`](examples/basic_kmodes.rs) - Basic k-modes clustering
 - [`kprototypes_mixed_data.rs`](examples/kprototypes_mixed_data.rs) - Mixed data clustering  
 - [`advanced_usage.rs`](examples/advanced_usage.rs) - Parameter tuning and optimization
+- [`jaccard_distance.rs`](examples/jaccard_distance.rs) - Jaccard distance metric usage
 
 Run examples with:
 ```bash
 cargo run --example basic_kmodes
 cargo run --example kprototypes_mixed_data
 cargo run --example advanced_usage
+cargo run --example jaccard_distance
 ```
 
 ## Benchmarks

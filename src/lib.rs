@@ -44,9 +44,10 @@ pub mod initialization;
 pub mod utils;
 
 pub use error::{Error, Result};
-pub use kmodes::{KModes, KModesResult};
+pub use kmodes::{KModes, KModesResult, DistanceMetric};
 pub use kprototypes::{KPrototypes, KPrototypesResult, MixedValue};
 pub use initialization::InitMethod;
+pub use distance::{CategoricalDistance, MatchingDistance, HammingDistance, JaccardDistance, EuclideanDistance};
 
 /// Re-export commonly used types from ndarray
 pub use ndarray::{Array1, Array2, ArrayView1, ArrayView2};

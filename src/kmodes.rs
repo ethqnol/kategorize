@@ -1,19 +1,37 @@
 //! K-modes clustering algorithm implementation
 
-use crate::distance::{compute_modes, CategoricalDistance, MatchingDistance};
+use crate::distance::{compute_modes, CategoricalDistance, MatchingDistance, JaccardDistance};
 use crate::error::{Error, Result};
 use crate::initialization::{initialize_centroids, InitMethod};
 use crate::utils::{
     assign_points_to_centroids, assignments_equal, calculate_cost, get_cluster_indices,
     validate_data, validate_parameters,
 };
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand::prelude::*;
 use rayon::prelude::*;
 use std::hash::Hash;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+/// Distance metric types available for k-modes clustering
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum DistanceMetric {
+    /// Simple matching distance (0 for match, 1 for mismatch)
+    Matching,
+    /// Hamming distance (normalized matching distance)
+    Hamming,
+    /// Jaccard distance (for set-based similarity)
+    Jaccard,
+}
+
+impl Default for DistanceMetric {
+    fn default() -> Self {
+        Self::Matching
+    }
+}
 
 /// K-modes clustering algorithm for categorical data
 #[derive(Debug, Clone)]
@@ -35,6 +53,8 @@ pub struct KModes {
     pub n_jobs: Option<usize>,
     /// Enable verbose output
     pub verbose: bool,
+    /// Distance metric to use for clustering
+    pub distance_metric: DistanceMetric,
 }
 
 /// Result of k-modes clustering
@@ -64,6 +84,7 @@ impl Default for KModes {
             random_state: None,
             n_jobs: None,
             verbose: false,
+            distance_metric: DistanceMetric::default(),
         }
     }
 }
@@ -119,6 +140,12 @@ impl KModes {
         self
     }
 
+    /// Set the distance metric to use for clustering
+    pub fn distance_metric(mut self, metric: DistanceMetric) -> Self {
+        self.distance_metric = metric;
+        self
+    }
+
     /// Fit the k-modes algorithm to the data and return cluster assignments
     pub fn fit<T>(&self, data: ArrayView2<T>) -> Result<KModesResult<T>>
     where
@@ -168,7 +195,6 @@ impl KModes {
         
         // Initialize centroids
         let mut centroids = initialize_centroids(data, self.n_clusters, self.init_method, &mut rng)?;
-        let distance_metric = MatchingDistance;
         
         let mut previous_labels: Option<Array1<usize>> = None;
         let mut n_iter = 0;
@@ -181,7 +207,7 @@ impl KModes {
             let labels = assign_points_to_centroids(
                 data,
                 centroids.view(),
-                |a, b| distance_metric.distance(a, b),
+                |a, b| self.compute_distance(a, b),
             )?;
 
             // Check for convergence
@@ -221,14 +247,14 @@ impl KModes {
         let final_labels = assign_points_to_centroids(
             data,
             centroids.view(),
-            |a, b| distance_metric.distance(a, b),
+            |a, b| self.compute_distance(a, b),
         )?;
 
         let inertia = calculate_cost(
             data,
             centroids.view(),
             final_labels.view(),
-            |a, b| distance_metric.distance(a, b),
+            |a, b| self.compute_distance(a, b),
         )?;
 
         Ok(KModesResult {
@@ -302,6 +328,27 @@ impl KModes {
         }
 
         Ok(())
+    }
+
+    /// Compute distance between two points using the selected metric
+    fn compute_distance<T>(&self, a: ArrayView1<T>, b: ArrayView1<T>) -> Result<f64>
+    where
+        T: Clone + Eq + Hash,
+    {
+        match self.distance_metric {
+            DistanceMetric::Matching => {
+                let metric = MatchingDistance;
+                metric.distance(a, b)
+            }
+            DistanceMetric::Hamming => {
+                let metric = crate::distance::HammingDistance;
+                metric.distance(a, b)
+            }
+            DistanceMetric::Jaccard => {
+                let metric = JaccardDistance;
+                metric.distance(a, b)
+            }
+        }
     }
 
     /// Determine if parallel processing should be used
@@ -426,5 +473,62 @@ mod tests {
         let data = Array2::from_shape_vec((0, 0), Vec::<&str>::new()).unwrap();
         let kmodes = KModes::new(1);
         assert!(kmodes.fit(data.view()).is_err());
+    }
+
+    #[test]
+    fn test_jaccard_distance_metric() {
+        let data = Array2::from_shape_vec(
+            (6, 2),
+            vec!["A", "X", "A", "X", "B", "Y", "B", "Y", "C", "Z", "C", "Z"],
+        ).unwrap();
+
+        let kmodes = KModes::new(3)
+            .distance_metric(DistanceMetric::Jaccard)
+            .random_state(42)
+            .n_init(3)
+            .max_iter(10);
+
+        let result = kmodes.fit(data.view()).unwrap();
+        
+        assert_eq!(result.labels.len(), 6);
+        assert_eq!(result.centroids.nrows(), 3);
+        assert_eq!(result.centroids.ncols(), 2);
+        assert!(result.n_iter <= 10);
+    }
+
+    #[test]
+    fn test_hamming_distance_metric() {
+        let data = Array2::from_shape_vec(
+            (4, 2),
+            vec!["A", "X", "A", "X", "B", "Y", "B", "Y"],
+        ).unwrap();
+
+        let kmodes = KModes::new(2)
+            .distance_metric(DistanceMetric::Hamming)
+            .random_state(42)
+            .n_init(1)
+            .max_iter(50);
+
+        let result = kmodes.fit(data.view()).unwrap();
+        
+        assert_eq!(result.labels.len(), 4);
+        assert_eq!(result.centroids.nrows(), 2);
+        assert_eq!(result.centroids.ncols(), 2);
+    }
+
+    #[test]
+    fn test_distance_metric_builder() {
+        let kmodes = KModes::new(5)
+            .distance_metric(DistanceMetric::Jaccard)
+            .init_method(InitMethod::Random);
+        
+        assert_eq!(kmodes.distance_metric, DistanceMetric::Jaccard);
+        assert_eq!(kmodes.init_method, InitMethod::Random);
+    }
+
+    #[test]
+    fn test_default_distance_metric() {
+        let kmodes = KModes::new(3);
+        assert_eq!(kmodes.distance_metric, DistanceMetric::Matching);
     }
 }
