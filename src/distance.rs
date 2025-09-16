@@ -170,20 +170,216 @@ impl PrototypesDistance {
     }
 }
 
+/// Frequency tracker for incremental mode computation
+#[derive(Debug, Clone)]
+pub struct FrequencyTracker<T: Clone + Eq + Hash> {
+    counts: HashMap<T, usize>,
+    mode: Option<T>,
+    mode_count: usize,
+    total_count: usize,
+}
+
+impl<T: Clone + Eq + Hash> FrequencyTracker<T> {
+    /// Create a new frequency tracker
+    pub fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+            mode: None,
+            mode_count: 0,
+            total_count: 0,
+        }
+    }
+
+    /// Add a value to the frequency tracker
+    pub fn add(&mut self, value: &T) {
+        let new_count = *self.counts.get(value).unwrap_or(&0) + 1;
+        self.counts.insert(value.clone(), new_count);
+        self.total_count += 1;
+
+        // Update mode if this value now has the highest count
+        if new_count > self.mode_count {
+            self.mode = Some(value.clone());
+            self.mode_count = new_count;
+        }
+    }
+
+    /// Remove a value from the frequency tracker
+    pub fn remove(&mut self, value: &T) -> Result<()> {
+        let current_count = self.counts.get(value).copied().unwrap_or(0);
+        
+        if current_count == 0 {
+            return Err(Error::computation_error("Cannot remove value not in tracker"));
+        }
+
+        self.total_count -= 1;
+        
+        if current_count == 1 {
+            self.counts.remove(value);
+        } else {
+            self.counts.insert(value.clone(), current_count - 1);
+        }
+
+        // If we removed the mode, we need to find the new mode
+        if self.mode.as_ref() == Some(value) && current_count == self.mode_count {
+            self.recompute_mode();
+        }
+
+        Ok(())
+    }
+
+    /// Get the current mode
+    pub fn mode(&self) -> Option<&T> {
+        self.mode.as_ref()
+    }
+
+    /// Clear all frequencies
+    pub fn clear(&mut self) {
+        self.counts.clear();
+        self.mode = None;
+        self.mode_count = 0;
+        self.total_count = 0;
+    }
+
+    /// Initialize with a set of values
+    pub fn init_with_values(&mut self, values: &[T]) {
+        self.clear();
+        for value in values {
+            self.add(value);
+        }
+    }
+
+    /// Recompute the mode from scratch (used when mode is invalidated)
+    fn recompute_mode(&mut self) {
+        if self.counts.is_empty() {
+            self.mode = None;
+            self.mode_count = 0;
+            return;
+        }
+
+        let (mode_value, mode_count) = self.counts.iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(value, count)| (value.clone(), *count))
+            .unwrap();
+        
+        self.mode = Some(mode_value);
+        self.mode_count = mode_count;
+    }
+}
+
+impl<T: Clone + Eq + Hash> Default for FrequencyTracker<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Utility functions for computing modes (most frequent values) in categorical data
 pub fn compute_mode<T: Clone + Eq + Hash>(values: &[T]) -> Option<T> {
     if values.is_empty() {
         return None;
     }
 
-    let mut counts = HashMap::new();
-    for value in values {
-        *counts.entry(value.clone()).or_insert(0) += 1;
+    let mut tracker = FrequencyTracker::new();
+    tracker.init_with_values(values);
+    tracker.mode().cloned()
+}
+
+/// Centroid tracker for efficient incremental mode computation
+#[derive(Debug, Clone)]
+pub struct CentroidTracker<T: Clone + Eq + Hash> {
+    feature_trackers: Vec<FrequencyTracker<T>>,
+    point_assignments: HashMap<usize, Vec<T>>, // Maps point index to its feature values
+}
+
+impl<T: Clone + Eq + Hash> CentroidTracker<T> {
+    /// Create a new centroid tracker with the given number of features
+    pub fn new(num_features: usize) -> Self {
+        Self {
+            feature_trackers: vec![FrequencyTracker::new(); num_features],
+            point_assignments: HashMap::new(),
+        }
     }
 
-    counts.into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(value, _)| value)
+    /// Add a data point to this centroid
+    pub fn add_point(&mut self, point_idx: usize, values: &[T]) -> Result<()> {
+        if values.len() != self.feature_trackers.len() {
+            return Err(Error::invalid_data("Point has wrong number of features"));
+        }
+
+        // Remove previous assignment if it exists
+        if let Some(old_values) = self.point_assignments.get(&point_idx) {
+            for (tracker, old_value) in self.feature_trackers.iter_mut().zip(old_values.iter()) {
+                tracker.remove(old_value)?;
+            }
+        }
+
+        // Add new assignment
+        for (tracker, value) in self.feature_trackers.iter_mut().zip(values.iter()) {
+            tracker.add(value);
+        }
+
+        self.point_assignments.insert(point_idx, values.to_vec());
+        Ok(())
+    }
+
+    /// Remove a data point from this centroid
+    pub fn remove_point(&mut self, point_idx: usize) -> Result<()> {
+        if let Some(values) = self.point_assignments.remove(&point_idx) {
+            for (tracker, value) in self.feature_trackers.iter_mut().zip(values.iter()) {
+                tracker.remove(value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Get the current centroid (modes for each feature)
+    pub fn get_centroid(&self) -> Result<Vec<T>> {
+        let mut centroid = Vec::with_capacity(self.feature_trackers.len());
+        
+        for tracker in &self.feature_trackers {
+            if let Some(mode) = tracker.mode() {
+                centroid.push(mode.clone());
+            } else {
+                return Err(Error::computation_error("No mode available for feature"));
+            }
+        }
+        
+        Ok(centroid)
+    }
+
+    /// Check if the centroid is empty (no points assigned)
+    pub fn is_empty(&self) -> bool {
+        self.point_assignments.is_empty()
+    }
+
+    /// Clear all assignments
+    pub fn clear(&mut self) {
+        for tracker in &mut self.feature_trackers {
+            tracker.clear();
+        }
+        self.point_assignments.clear();
+    }
+
+    /// Initialize with a set of data points
+    pub fn init_with_points<I>(&mut self, data: ArrayView2<T>, point_indices: I) -> Result<()>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        self.clear();
+        
+        for point_idx in point_indices {
+            if point_idx >= data.nrows() {
+                return Err(Error::invalid_data("Point index out of bounds"));
+            }
+            
+            let point_values: Vec<T> = (0..data.ncols())
+                .map(|col| data[[point_idx, col]].clone())
+                .collect();
+            
+            self.add_point(point_idx, &point_values)?;
+        }
+        
+        Ok(())
+    }
 }
 
 /// Compute modes for each feature across all data points in a cluster
@@ -195,20 +391,9 @@ pub fn compute_modes<T: Clone + Eq + Hash>(
         return Err(Error::invalid_data("Cannot compute mode of empty cluster"));
     }
 
-    let mut modes = Vec::with_capacity(data.ncols());
-    
-    for col_idx in 0..data.ncols() {
-        let column_values: Vec<T> = indices.iter()
-            .map(|&row_idx| data[[row_idx, col_idx]].clone())
-            .collect();
-        
-        let mode = compute_mode(&column_values)
-            .ok_or_else(|| Error::computation_error("Unable to compute mode for cluster"))?;
-        
-        modes.push(mode);
-    }
-
-    Ok(modes)
+    let mut tracker = CentroidTracker::new(data.ncols());
+    tracker.init_with_points(data, indices.iter().copied())?;
+    tracker.get_centroid()
 }
 
 #[cfg(test)]
@@ -336,5 +521,84 @@ mod tests {
         assert_eq!(distances.len(), 2);
         assert_eq!(distances[0], 0.0); // Identical to first centroid
         assert_eq!(distances[1], 1.0); // Disjoint from second centroid
+    }
+
+    #[test]
+    fn test_frequency_tracker() {
+        let mut tracker = FrequencyTracker::new();
+        
+        // Test empty tracker
+        assert_eq!(tracker.mode(), None);
+        
+        // Add values
+        tracker.add(&"A");
+        assert_eq!(tracker.mode(), Some(&"A"));
+        
+        tracker.add(&"B");
+        tracker.add(&"A");
+        assert_eq!(tracker.mode(), Some(&"A")); // A appears twice, B once
+        
+        // Remove a value
+        tracker.remove(&"A").unwrap();
+        // Now A and B both appear once, but A was added first so it should still be mode
+        // (depending on HashMap iteration order, but it should be consistent)
+        assert!(tracker.mode().is_some());
+        
+        // Add more B's to make B the mode
+        tracker.add(&"B");
+        assert_eq!(tracker.mode(), Some(&"B")); // B now appears twice
+    }
+
+    #[test]
+    fn test_frequency_tracker_init_with_values() {
+        let mut tracker = FrequencyTracker::new();
+        let values = vec!["A", "B", "A", "C", "A"];
+        tracker.init_with_values(&values);
+        
+        assert_eq!(tracker.mode(), Some(&"A")); // A appears 3 times
+    }
+
+    #[test]
+    fn test_centroid_tracker() {
+        let data = Array2::from_shape_vec((3, 2), vec!["A", "X", "B", "Y", "A", "X"]).unwrap();
+        let mut tracker = CentroidTracker::new(2);
+        
+        // Add points
+        tracker.add_point(0, &["A", "X"]).unwrap();
+        tracker.add_point(2, &["A", "X"]).unwrap();
+        
+        let centroid = tracker.get_centroid().unwrap();
+        assert_eq!(centroid, vec!["A", "X"]);
+        
+        // Remove a point
+        tracker.remove_point(0).unwrap();
+        let centroid = tracker.get_centroid().unwrap();
+        assert_eq!(centroid, vec!["A", "X"]); // Still the same since both points had same values
+        
+        // Add a different point
+        tracker.add_point(1, &["B", "Y"]).unwrap();
+        // Now we have two different values, the mode should be consistent
+        let centroid = tracker.get_centroid().unwrap();
+        assert_eq!(centroid.len(), 2);
+    }
+
+    #[test]
+    fn test_centroid_tracker_init_with_points() {
+        let data = Array2::from_shape_vec((4, 2), vec!["A", "X", "A", "X", "B", "Y", "B", "Y"]).unwrap();
+        let mut tracker = CentroidTracker::new(2);
+        
+        // Initialize with points 0 and 1 (both have ["A", "X"])
+        tracker.init_with_points(data.view(), vec![0, 1]).unwrap();
+        
+        let centroid = tracker.get_centroid().unwrap();
+        assert_eq!(centroid, vec!["A", "X"]);
+        
+        // Clear and initialize with all points
+        tracker.clear();
+        tracker.init_with_points(data.view(), vec![0, 1, 2, 3]).unwrap();
+        
+        // Should have mixed modes now
+        let centroid = tracker.get_centroid().unwrap();
+        assert_eq!(centroid.len(), 2);
     }
 }

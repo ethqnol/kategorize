@@ -1,6 +1,6 @@
 //! K-modes clustering algorithm implementation
 
-use crate::distance::{compute_modes, CategoricalDistance, MatchingDistance, JaccardDistance};
+use crate::distance::{compute_modes, CategoricalDistance, MatchingDistance, JaccardDistance, CentroidTracker};
 use crate::error::{Error, Result};
 use crate::initialization::{initialize_centroids, InitMethod};
 use crate::utils::{
@@ -55,6 +55,8 @@ pub struct KModes {
     pub verbose: bool,
     /// Distance metric to use for clustering
     pub distance_metric: DistanceMetric,
+    /// Enable incremental mode updates for better performance
+    pub use_incremental_updates: bool,
 }
 
 /// Result of k-modes clustering
@@ -85,6 +87,7 @@ impl Default for KModes {
             n_jobs: None,
             verbose: false,
             distance_metric: DistanceMetric::default(),
+            use_incremental_updates: true,
         }
     }
 }
@@ -146,6 +149,12 @@ impl KModes {
         self
     }
 
+    /// Enable or disable incremental mode updates
+    pub fn use_incremental_updates(mut self, use_incremental: bool) -> Self {
+        self.use_incremental_updates = use_incremental;
+        self
+    }
+
     /// Fit the k-modes algorithm to the data and return cluster assignments
     pub fn fit<T>(&self, data: ArrayView2<T>) -> Result<KModesResult<T>>
     where
@@ -188,6 +197,18 @@ impl KModes {
 
     /// Single run of k-modes algorithm
     fn fit_single<T>(&self, data: ArrayView2<T>, seed: u64) -> Result<KModesResult<T>>
+    where
+        T: Clone + Eq + Hash,
+    {
+        if self.use_incremental_updates {
+            self.fit_single_incremental(data, seed)
+        } else {
+            self.fit_single_classic(data, seed)
+        }
+    }
+
+    /// Classic single run of k-modes algorithm (original implementation)
+    fn fit_single_classic<T>(&self, data: ArrayView2<T>, seed: u64) -> Result<KModesResult<T>>
     where
         T: Clone + Eq + Hash,
     {
@@ -266,6 +287,99 @@ impl KModes {
         })
     }
 
+    /// Incremental single run of k-modes algorithm with optimized mode updates
+    fn fit_single_incremental<T>(&self, data: ArrayView2<T>, seed: u64) -> Result<KModesResult<T>>
+    where
+        T: Clone + Eq + Hash,
+    {
+        let mut rng = StdRng::seed_from_u64(seed);
+        
+        // Initialize centroids
+        let mut centroids = initialize_centroids(data, self.n_clusters, self.init_method, &mut rng)?;
+        
+        // Initialize centroid trackers for incremental updates
+        let mut centroid_trackers: Vec<CentroidTracker<T>> = (0..self.n_clusters)
+            .map(|_| CentroidTracker::new(data.ncols()))
+            .collect();
+        
+        let mut previous_labels: Option<Array1<usize>> = None;
+        let mut n_iter = 0;
+        let mut converged = false;
+
+        // Initial assignment to populate trackers
+        let mut current_labels = assign_points_to_centroids(
+            data,
+            centroids.view(),
+            |a, b| self.compute_distance(a, b),
+        )?;
+
+        // Initialize trackers with initial assignments
+        self.update_trackers_full(&mut centroid_trackers, data, &current_labels)?;
+
+        for iter in 0..self.max_iter {
+            n_iter = iter + 1;
+            
+            // Assign points to closest centroids
+            let new_labels = assign_points_to_centroids(
+                data,
+                centroids.view(),
+                |a, b| self.compute_distance(a, b),
+            )?;
+
+            // Check for convergence
+            if let Some(ref prev_labels) = previous_labels {
+                if assignments_equal(new_labels.view(), prev_labels.view()) {
+                    converged = true;
+                    if self.verbose {
+                        println!("K-modes converged after {} iterations", n_iter);
+                    }
+                    break;
+                }
+            }
+
+            // Update trackers incrementally based on assignment changes
+            self.update_trackers_incremental(&mut centroid_trackers, data, &current_labels, &new_labels)?;
+            
+            // Get new centroids from trackers
+            let new_centroids = self.get_centroids_from_trackers(&centroid_trackers, data)?;
+            
+            // Check if centroids changed significantly
+            if let Some(ref _prev_labels) = previous_labels {
+                let centroid_change = self.calculate_centroid_change(&centroids, &new_centroids)?;
+                if centroid_change < self.tol {
+                    converged = true;
+                    if self.verbose {
+                        println!("K-modes converged (centroid change < tol) after {} iterations", n_iter);
+                    }
+                    break;
+                }
+            }
+
+            centroids = new_centroids;
+            previous_labels = Some(current_labels);
+            current_labels = new_labels;
+
+            if self.verbose && (iter + 1) % 10 == 0 {
+                println!("K-modes iteration {}", iter + 1);
+            }
+        }
+
+        let inertia = calculate_cost(
+            data,
+            centroids.view(),
+            current_labels.view(),
+            |a, b| self.compute_distance(a, b),
+        )?;
+
+        Ok(KModesResult {
+            labels: current_labels,
+            centroids,
+            n_iter,
+            inertia,
+            converged,
+        })
+    }
+
     /// Update centroids by computing the mode of each cluster
     fn update_centroids<T>(&self, data: ArrayView2<T>, labels: &Array1<usize>) -> Result<Array2<T>>
     where
@@ -293,6 +407,112 @@ impl KModes {
 
         // Safety: we've initialized all elements
         Ok(unsafe { new_centroids.assume_init() })
+    }
+
+    /// Initialize all trackers with full assignment data
+    fn update_trackers_full<T>(
+        &self, 
+        trackers: &mut [CentroidTracker<T>], 
+        data: ArrayView2<T>, 
+        labels: &Array1<usize>
+    ) -> Result<()>
+    where
+        T: Clone + Eq + Hash,
+    {
+        // Clear all trackers
+        for tracker in trackers.iter_mut() {
+            tracker.clear();
+        }
+
+        // Add all points to their assigned clusters
+        for (point_idx, &cluster_id) in labels.iter().enumerate() {
+            if cluster_id < trackers.len() {
+                let point_values: Vec<T> = (0..data.ncols())
+                    .map(|col| data[[point_idx, col]].clone())
+                    .collect();
+                trackers[cluster_id].add_point(point_idx, &point_values)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update trackers incrementally based on assignment changes
+    fn update_trackers_incremental<T>(
+        &self, 
+        trackers: &mut [CentroidTracker<T>], 
+        data: ArrayView2<T>, 
+        old_labels: &Array1<usize>, 
+        new_labels: &Array1<usize>
+    ) -> Result<()>
+    where
+        T: Clone + Eq + Hash,
+    {
+        // Process points that changed cluster assignments
+        for (point_idx, (&old_cluster, &new_cluster)) in 
+            old_labels.iter().zip(new_labels.iter()).enumerate() 
+        {
+            if old_cluster != new_cluster {
+                let point_values: Vec<T> = (0..data.ncols())
+                    .map(|col| data[[point_idx, col]].clone())
+                    .collect();
+
+                // Remove from old cluster (if valid)
+                if old_cluster < trackers.len() {
+                    trackers[old_cluster].remove_point(point_idx)?;
+                }
+
+                // Add to new cluster (if valid) 
+                if new_cluster < trackers.len() {
+                    trackers[new_cluster].add_point(point_idx, &point_values)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get centroids from all trackers
+    fn get_centroids_from_trackers<T>(&self, trackers: &[CentroidTracker<T>], data: ArrayView2<T>) -> Result<Array2<T>>
+    where
+        T: Clone + Eq + Hash,
+    {
+        if trackers.is_empty() {
+            return Err(Error::computation_error("No trackers provided"));
+        }
+
+        // Get number of features from first non-empty tracker or data
+        let num_features = trackers.iter()
+            .find_map(|tracker| {
+                if !tracker.is_empty() {
+                    tracker.get_centroid().ok().map(|centroid| centroid.len())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(data.ncols());
+
+        let mut centroids = Array2::uninit((self.n_clusters, num_features));
+
+        for (cluster_id, tracker) in trackers.iter().enumerate() {
+            if tracker.is_empty() {
+                // Handle empty cluster by assigning a random data point as centroid
+                let mut rng = StdRng::seed_from_u64(self.random_state.unwrap_or(0) + cluster_id as u64);
+                let random_idx = rng.gen_range(0..data.nrows());
+                
+                for feature_idx in 0..num_features {
+                    centroids[[cluster_id, feature_idx]].write(data[[random_idx, feature_idx]].clone());
+                }
+            } else {
+                let centroid_values = tracker.get_centroid()?;
+                for (feature_idx, value) in centroid_values.into_iter().enumerate() {
+                    centroids[[cluster_id, feature_idx]].write(value);
+                }
+            }
+        }
+
+        // Safety: we've initialized all elements
+        Ok(unsafe { centroids.assume_init() })
     }
 
     /// Calculate the change in centroids between iterations
